@@ -1,0 +1,6 @@
+# Build artifacts
+*.o
+mygit
+
+# Test directories
+test_*
