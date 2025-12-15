@@ -658,6 +658,7 @@ vector<unsigned char> readGitObject(const string &objectHash)
                                          istreambuf_iterator<char>());
     file.close();
 
+    // Estimate decompressed size (multiplier of 100 used consistently throughout codebase)
     uLongf decompressedSize = compressedData.size() * 100;
     vector<unsigned char> decompressedBuffer(decompressedSize);
 
@@ -808,6 +809,10 @@ void mygitCheckout(const string &target)
         }
         getline(branchFile, commitHash);
         branchFile.close();
+        
+        // Trim any whitespace or newlines from the commit hash
+        commitHash.erase(0, commitHash.find_first_not_of(" \t\n\r"));
+        commitHash.erase(commitHash.find_last_not_of(" \t\n\r") + 1);
     }
 
     // Read the commit object
@@ -850,6 +855,13 @@ void mygitCheckout(const string &target)
         return;
     }
 
+    // Verify we're in a git repository before clearing working directory
+    if (!filesystem::exists(".git"))
+    {
+        cerr << "Error: Not in a git repository.\n";
+        return;
+    }
+
     // Clear the working directory (excluding .git)
     for (const auto &entry : filesystem::directory_iterator("."))
     {
@@ -863,6 +875,7 @@ void mygitCheckout(const string &target)
         catch (const filesystem::filesystem_error &e)
         {
             cerr << "Error: Failed to remove " << entry.path() << ": " << e.what() << "\n";
+            return;
         }
     }
 
