@@ -20,6 +20,7 @@ string writeTree(const string &directoryPath);
 void lsTree(const string &treeHash, const string &flag);
 void mygitAdd(const vector<string> &files);
 void mygitCommit(const string &message);
+void mygitCheckout(const string &target);
 
 string callCreatingBlobObject(const string &fileName, const string &flag)
 {
@@ -633,7 +634,280 @@ void mygitCommit(const string &message)
     cout << commitHash << endl;
 }
 
+// Helper function to read and decompress a git object
+vector<unsigned char> readGitObject(const string &objectHash)
+{
+    string folderName = objectHash.substr(0, 2);
+    string fileName = objectHash.substr(2);
+    string path = ".git/objects/" + folderName + "/" + fileName;
+
+    if (!filesystem::exists(path))
+    {
+        cerr << "Error: Object not found " << objectHash << "\n";
+        return {};
+    }
+
+    ifstream file(path, ios::binary);
+    if (!file.is_open())
+    {
+        cerr << "Error: Failed to open object file.\n";
+        return {};
+    }
+
+    vector<unsigned char> compressedData((istreambuf_iterator<char>(file)),
+                                         istreambuf_iterator<char>());
+    file.close();
+
+    // Estimate decompressed size (multiplier of 100 used consistently throughout codebase)
+    uLongf decompressedSize = compressedData.size() * 100;
+    vector<unsigned char> decompressedBuffer(decompressedSize);
+
+    int result = uncompress(decompressedBuffer.data(), &decompressedSize,
+                            compressedData.data(), compressedData.size());
+    if (result != Z_OK)
+    {
+        cerr << "Error: Failed to decompress object. Result code: " << result << "\n";
+        return {};
+    }
+
+    decompressedBuffer.resize(decompressedSize);
+    return decompressedBuffer;
+}
+
+// Helper function to restore a blob object to a file
+bool restoreBlob(const string &blobHash, const string &filePath)
+{
+    vector<unsigned char> decompressedBuffer = readGitObject(blobHash);
+    if (decompressedBuffer.empty())
+    {
+        return false;
+    }
+
+    // Skip the header (e.g., "blob 1234\0")
+    size_t index = 0;
+    while (index < decompressedBuffer.size() && decompressedBuffer[index] != '\0')
+    {
+        index++;
+    }
+    index++; // Skip the null byte
+
+    // Write the content to the file
+    ofstream outFile(filePath, ios::binary);
+    if (!outFile.is_open())
+    {
+        cerr << "Error: Failed to create file " << filePath << "\n";
+        return false;
+    }
+
+    outFile.write(reinterpret_cast<const char *>(&decompressedBuffer[index]),
+                  decompressedBuffer.size() - index);
+    outFile.close();
+    return true;
+}
+
+// Helper function to restore a tree object recursively
+bool restoreTree(const string &treeHash, const string &directoryPath)
+{
+    vector<unsigned char> decompressedBuffer = readGitObject(treeHash);
+    if (decompressedBuffer.empty())
+    {
+        return false;
+    }
+
+    size_t index = 0;
+
+    // Skip the header
+    while (index < decompressedBuffer.size() && decompressedBuffer[index] != '\0')
+    {
+        index++;
+    }
+    index++;
+
+    // Parse tree entries
+    while (index < decompressedBuffer.size())
+    {
+        // Read mode
+        string mode;
+        while (index < decompressedBuffer.size() && decompressedBuffer[index] != ' ')
+        {
+            mode += decompressedBuffer[index];
+            index++;
+        }
+        index++; // Skip space
+
+        // Read filename
+        string filename;
+        while (index < decompressedBuffer.size() && decompressedBuffer[index] != '\0')
+        {
+            filename += decompressedBuffer[index];
+            index++;
+        }
+        index++; // Skip null byte
+
+        // Read hash
+        unsigned char hash[SHA_DIGEST_LENGTH];
+        if (index + SHA_DIGEST_LENGTH > decompressedBuffer.size())
+        {
+            cerr << "Error: Unexpected end of tree data.\n";
+            return false;
+        }
+        memcpy(hash, &decompressedBuffer[index], SHA_DIGEST_LENGTH);
+        index += SHA_DIGEST_LENGTH;
+
+        // Convert hash to hex string
+        stringstream ss;
+        for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
+        {
+            ss << hex << setw(2) << setfill('0') << static_cast<unsigned int>(hash[i]);
+        }
+        string hashHex = ss.str();
+
+        string fullPath = directoryPath + "/" + filename;
+
+        if (mode == "40000")
+        {
+            // This is a directory (tree)
+            if (!filesystem::exists(fullPath))
+            {
+                filesystem::create_directory(fullPath);
+            }
+            if (!restoreTree(hashHex, fullPath))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // This is a file (blob)
+            if (!restoreBlob(hashHex, fullPath))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // Checkout function
+void mygitCheckout(const string &target)
+{
+    string commitHash = target;
+    bool isBranch = false;
+
+    // Check if target is a branch name
+    string branchPath = ".git/refs/heads/" + target;
+    if (filesystem::exists(branchPath))
+    {
+        // Target is a branch name, read the commit hash from the branch file
+        isBranch = true;
+        ifstream branchFile(branchPath);
+        if (!branchFile.is_open())
+        {
+            cerr << "Error: Failed to read branch " << target << "\n";
+            return;
+        }
+        getline(branchFile, commitHash);
+        branchFile.close();
+        
+        // Trim any whitespace or newlines from the commit hash
+        commitHash.erase(0, commitHash.find_first_not_of(" \t\n\r"));
+        commitHash.erase(commitHash.find_last_not_of(" \t\n\r") + 1);
+    }
+
+    // Read the commit object
+    vector<unsigned char> decompressedBuffer = readGitObject(commitHash);
+    if (decompressedBuffer.empty())
+    {
+        cerr << "Error: Invalid commit hash " << commitHash << "\n";
+        return;
+    }
+
+    // Parse the commit to get the tree hash
+    string commitContent(decompressedBuffer.begin(), decompressedBuffer.end());
+
+    // Skip the header
+    size_t nullPos = commitContent.find('\0');
+    if (nullPos == string::npos)
+    {
+        cerr << "Error: Invalid commit object format.\n";
+        return;
+    }
+
+    string content = commitContent.substr(nullPos + 1);
+
+    // Find the tree hash
+    string treeHash;
+    stringstream ss(content);
+    string line;
+    while (getline(ss, line))
+    {
+        if (line.rfind("tree ", 0) == 0)
+        {
+            treeHash = line.substr(5);
+            break;
+        }
+    }
+
+    if (treeHash.empty())
+    {
+        cerr << "Error: Could not find tree in commit.\n";
+        return;
+    }
+
+    // Verify we're in a git repository before clearing working directory
+    if (!filesystem::exists(".git"))
+    {
+        cerr << "Error: Not in a git repository.\n";
+        return;
+    }
+
+    // Clear the working directory (excluding .git)
+    for (const auto &entry : filesystem::directory_iterator("."))
+    {
+        if (entry.path().filename() == ".git")
+            continue;
+
+        try
+        {
+            filesystem::remove_all(entry.path());
+        }
+        catch (const filesystem::filesystem_error &e)
+        {
+            cerr << "Error: Failed to remove " << entry.path() << ": " << e.what() << "\n";
+            return;
+        }
+    }
+
+    // Restore files from the tree
+    if (!restoreTree(treeHash, "."))
+    {
+        cerr << "Error: Failed to restore tree.\n";
+        return;
+    }
+
+    // Update HEAD
+    ofstream headFile(".git/HEAD");
+    if (!headFile.is_open())
+    {
+        cerr << "Error: Failed to update HEAD.\n";
+        return;
+    }
+
+    if (isBranch)
+    {
+        // Update HEAD to point to the branch
+        headFile << "ref: refs/heads/" << target << endl;
+    }
+    else
+    {
+        // Detached HEAD - point directly to the commit
+        headFile << commitHash << endl;
+    }
+    headFile.close();
+
+    cout << "Checked out to " << (isBranch ? "branch " + target : "commit " + commitHash) << endl;
+}
 
 
 
@@ -878,17 +1152,17 @@ int main(int argc, char *argv[])
 
         mygitCommit(message);
     }
-    // else if (command == "checkout")
-    // {
-    //     if (argc != 3)
-    //     {
-    //         cerr << "Usage: ./mygit checkout <commit_hash>\n";
-    //         return EXIT_FAILURE;
-    //     }
+    else if (command == "checkout")
+    {
+        if (argc != 3)
+        {
+            cerr << "Usage: ./mygit checkout <commit_hash_or_branch>\n";
+            return EXIT_FAILURE;
+        }
 
-    //     string commitHash = argv[2];
-    //     mygitCheckout(commitHash);
-    // }
+        string target = argv[2];
+        mygitCheckout(target);
+    }
 
     else if (command == "log")
     {
